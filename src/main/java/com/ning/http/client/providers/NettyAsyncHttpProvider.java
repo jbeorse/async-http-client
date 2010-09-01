@@ -161,6 +161,9 @@ public class NettyAsyncHttpProvider extends IdleStateHandler implements AsyncHtt
     private Channel lookupInCache(URI uri) {
         Channel channel = removeConnection(getBaseUrl(uri));
         if (channel != null) {
+			AtomicInteger connectionPerHost = connectionsPerHost.get(getBaseUrl(uri));
+			connectionPerHost.decrementAndGet();
+			connectionsPerHost.put(getBaseUrl(uri), connectionPerHost);
             /**
              * The Channel will eventually be closed by Netty and will becomes invalid.
              * We might suffer a memory leak if we don't scan for closed channel. The
@@ -648,7 +651,7 @@ public class NettyAsyncHttpProvider extends IdleStateHandler implements AsyncHtt
         if (future.getKeepAlive()){
             AtomicInteger connectionPerHost = connectionsPerHost.get(getBaseUrl(future.getURI()));
             if (connectionPerHost == null) {
-                connectionPerHost = new AtomicInteger(1);
+                connectionPerHost = new AtomicInteger(0);
                 connectionsPerHost.put(getBaseUrl(future.getURI()),connectionPerHost);
             }
 
