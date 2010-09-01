@@ -95,6 +95,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.HashSet;
 
 import static org.jboss.netty.channel.Channels.pipeline;
 
@@ -105,7 +106,7 @@ public class NettyAsyncHttpProvider extends IdleStateHandler implements AsyncHtt
 
     private final AsyncHttpClientConfig config;
 
-    private final ConcurrentHashMap<String, Channel> connectionsPool = new ConcurrentHashMap<String, Channel>();
+    private final ConcurrentHashMap<String, HashSet<Channel>> connectionsPool = new ConcurrentHashMap<String, HashSet<Channel>>();
 
     private final AtomicInteger activeConnectionsCount = new AtomicInteger();
 
@@ -158,7 +159,7 @@ public class NettyAsyncHttpProvider extends IdleStateHandler implements AsyncHtt
     }
 
     private Channel lookupInCache(URI uri) {
-        Channel channel = connectionsPool.remove(getBaseUrl(uri));
+        Channel channel = removeConnection(getBaseUrl(uri));
         if (channel != null) {
             /**
              * The Channel will eventually be closed by Netty and will becomes invalid.
@@ -487,6 +488,7 @@ public class NettyAsyncHttpProvider extends IdleStateHandler implements AsyncHtt
             executeRequest(channel, config,f,nettyRequest);
             return f;
         }
+		
         ConnectListener<T> c = new ConnectListener.Builder<T>(config, request, asyncHandler,f).build();
         configure(uri.getScheme().compareToIgnoreCase("https") == 0, c);
 
@@ -517,15 +519,10 @@ public class NettyAsyncHttpProvider extends IdleStateHandler implements AsyncHtt
         NettyResponseFuture<?> future = (NettyResponseFuture<?>) ctx.getAttachment();
         closeChannel(ctx);
         
-        for (Entry<String,Channel> e: connectionsPool.entrySet()) {
-            if (e.getValue().equals(ctx.getChannel())) {
-                connectionsPool.remove(e.getKey());
-                if (config.getMaxTotalConnections() != -1) {
-                    activeConnectionsCount.decrementAndGet();
-                }
-                break;
-            }
-        }
+        if(removeChannel(ctx.getChannel())){
+			activeConnectionsCount.decrementAndGet();
+		}
+		
         future.abort(new IOException("No response received. Connection timed out after " + config.getIdleConnectionTimeoutInMs()));
     }
 
@@ -656,7 +653,7 @@ public class NettyAsyncHttpProvider extends IdleStateHandler implements AsyncHtt
             }
 
             if (config.getMaxConnectionPerHost() == -1 || connectionPerHost.getAndIncrement() < config.getMaxConnectionPerHost()) {
-                connectionsPool.put(getBaseUrl(future.getURI()), channel);
+				putConnection(getBaseUrl(future.getURI()), channel);
             } else {
                 connectionPerHost.decrementAndGet();
                 log.warn("Maximum connections per hosts reached " + config.getMaxConnectionPerHost());
@@ -699,6 +696,90 @@ public class NettyAsyncHttpProvider extends IdleStateHandler implements AsyncHtt
             log.debug(ex);
         }
     }
+	
+	private synchronized Channel getConnection(String url){
+		if (!connectionsPool.containsKey(url)) {
+			return null;
+		}
+		
+		HashSet<Channel> channels = connectionsPool.get(url);
+		Iterator<Channel> iterator = channels.iterator();
+		if(iterator == null || !iterator.hasNext()){
+			return null;
+		}
+		
+		connectionsPool.put(url, channels);
+		
+		//Return any matching connection
+		return iterator.next();
+	}
+	
+	private synchronized Channel removeConnection(String url){
+		if (!connectionsPool.containsKey(url)) {
+			return null;
+		}
+		
+		HashSet<Channel> channels = connectionsPool.get(url);
+		Iterator<Channel> iterator = channels.iterator();
+		if(iterator == null || !iterator.hasNext()){
+			return null;
+		}
+		
+		//Return any matching connection
+		Channel channel = iterator.next();
+		channels.remove(channel);
+		
+		//If this is the last connection to this url, remove
+		//the entry in the map
+		if (channels.size() == 0) {
+			connectionsPool.remove(url);
+		} else {
+			connectionsPool.put(url, channels);
+		}
+
+		return channel;
+	}
+	
+	private synchronized boolean removeChannel(Channel toRemove){
+		if (connectionsPool.isEmpty()) {
+			return false;
+		}
+		
+		Channel channel = null;
+		for (Entry<String, HashSet<Channel>> e: connectionsPool.entrySet()){
+			HashSet<Channel> channels = e.getValue();
+			Iterator<Channel> iterator  = channels.iterator();
+			while (iterator.hasNext()) {
+				channel = iterator.next();
+				if (channel==toRemove) {
+					channels.remove(channel);
+					if (channels.size() == 0) {
+						connectionsPool.remove(e.getKey());
+					} else {
+						connectionsPool.put(e.getKey(), channels);
+					}
+					
+					return true;
+
+				}
+			}
+		}
+		return false;
+	}
+	
+	private synchronized void putConnection(String url, Channel channel){
+		HashSet<Channel> channels = null;
+		if(!connectionsPool.containsKey(url)){
+			channels = new HashSet<Channel>();
+		} else {
+			channels = connectionsPool.get(url);
+		}
+
+		channels.add(channel);
+		connectionsPool.put(url, channels);
+		
+	}
+		
 
     @SuppressWarnings("unchecked")
     private final boolean updateStatusAndInterrupt(AsyncHandler handler, HttpResponseStatus c) throws Exception {
